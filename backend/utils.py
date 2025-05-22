@@ -173,37 +173,103 @@ def format_pf_non_streaming_response(
         logging.error(f"Error in promptflow response api: {chatCompletion['error']}")
         return {"error": chatCompletion["error"]}
 
-    logging.debug(f"chatCompletion: {chatCompletion}")
-    try:
-        messages = []
+    # First, log the raw structure to help with debugging
+    logging.debug(f"Raw chatCompletion structure to format: {json.dumps(chatCompletion, indent=2)}")
+    
+    # Standardize field names for easier reference
+    standard_resp_field = "output"
+    standard_citations_field = "citations"
+    
+    # Extract answer content and citations
+    answer_content = ""
+    citations = []
+    
+    # Case 1: Nested output structure (AI Foundry pattern)
+    if "output" in chatCompletion and isinstance(chatCompletion["output"], dict):
+        out = chatCompletion["output"]
+        logging.debug(f"Processing nested output structure with keys: {list(out.keys())}")
+        
+        # Try multiple possible locations for the answer content
+        if standard_resp_field in out:
+            answer_content = out[standard_resp_field]
+            logging.debug(f"Found answer in output.{standard_resp_field}")
+        elif response_field_name in out:
+            answer_content = out[response_field_name]
+            logging.debug(f"Found answer in output.{response_field_name}")
+        
+        # Try multiple possible locations for citations
+        if standard_citations_field in out:
+            citations = out[standard_citations_field]
+            logging.debug(f"Found {len(citations)} citations in output.{standard_citations_field}")
+        elif citations_field_name in out:
+            citations = out[citations_field_name]
+            logging.debug(f"Found {len(citations)} citations in output.{citations_field_name}")
+    
+    # Case 2: Flat structure with direct fields
+    else:
+        # Try multiple possible field names for answer content
         if response_field_name in chatCompletion:
-            messages.append({
-                "role": "assistant",
-                "content": chatCompletion[response_field_name] 
-            })
+            answer_content = chatCompletion[response_field_name]
+            logging.debug(f"Found answer directly in {response_field_name}")
+        elif standard_resp_field in chatCompletion:
+            answer_content = chatCompletion[standard_resp_field]
+            logging.debug(f"Found answer directly in {standard_resp_field}")
+            
+        # Try multiple possible field names for citations
         if citations_field_name in chatCompletion:
-            citation_content= {"citations": chatCompletion[citations_field_name]}
-            messages.append({ 
-                "role": "tool",
-                "content": json.dumps(citation_content)
-            })
+            citations = chatCompletion[citations_field_name]
+            logging.debug(f"Found {len(citations)} citations directly in {citations_field_name}")
+        elif standard_citations_field in chatCompletion:
+            citations = chatCompletion[standard_citations_field]
+            logging.debug(f"Found {len(citations)} citations directly in {standard_citations_field}")
+    
+    # Log what we extracted
+    logging.debug(f"Extracted answer content (first 100 chars): {answer_content[:100]}...")
+    logging.debug(f"Extracted {len(citations)} citations")
+    
+    # Create messages from extracted content
+    messages = []
+    if answer_content:
+        messages.append({
+            "role": "assistant",
+            "content": answer_content
+        })
+    if citations:
+        citation_content = {"citations": citations}
+        messages.append({ 
+            "role": "tool",
+            "content": json.dumps(citation_content)
+        })
+    
+    # Check if we have any messages to return
+    if not messages:
+        logging.warning("No content extracted from response - unable to create any messages")
+        if "output" in chatCompletion and not isinstance(chatCompletion["output"], dict):
+            # Fallback: try using the output field directly if it's a string
+            direct_output = chatCompletion["output"]
+            if isinstance(direct_output, str):
+                logging.debug("Using direct string output as fallback")
+                messages.append({
+                    "role": "assistant",
+                    "content": direct_output
+                })
 
-        response_obj = {
-            "id": chatCompletion["id"],
-            "model": "",
-            "created": "",
-            "object": "",
-            "history_metadata": history_metadata,
-            "choices": [
-                {
-                    "messages": messages,
-                }
-            ]
-        }
-        return response_obj
-    except Exception as e:
-        logging.error(f"Exception in format_pf_non_streaming_response: {e}")
-        return {}
+    # Construct and return the response object
+    response_obj = {
+        "id": chatCompletion.get("id", ""),
+        "model": "",
+        "created": "",
+        "object": "",
+        "history_metadata": history_metadata,
+        "choices": [
+            {
+                "messages": messages,
+            }
+        ]
+    }
+    
+    logging.debug(f"Final formatted response: {json.dumps(response_obj, indent=2)}")
+    return response_obj
 
 
 def convert_to_pf_format(input_json, request_field_name, response_field_name):

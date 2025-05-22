@@ -353,29 +353,63 @@ async def promptflow_request(request):
         }
         # Adding timeout for scenarios where response takes longer to come back
         logging.debug(f"Setting timeout to {app_settings.promptflow.response_timeout}")
+        
+        # Log the request payload
+        pf_formatted_obj = convert_to_pf_format(
+            request,
+            app_settings.promptflow.request_field_name,
+            app_settings.promptflow.response_field_name
+        )
+        
+        request_payload = {
+            app_settings.promptflow.request_field_name: pf_formatted_obj[-1]["inputs"][app_settings.promptflow.request_field_name],
+            "chat_history": pf_formatted_obj[:-1],
+        }
+        
+        logging.debug(f"PromptFlow request payload: {json.dumps(request_payload, indent=2)}")
+        
         async with httpx.AsyncClient(
             timeout=float(app_settings.promptflow.response_timeout)
         ) as client:
-            pf_formatted_obj = convert_to_pf_format(
-                request,
-                app_settings.promptflow.request_field_name,
-                app_settings.promptflow.response_field_name
-            )
             # NOTE: This only support question and chat_history parameters
             # If you need to add more parameters, you need to modify the request body
             response = await client.post(
                 app_settings.promptflow.endpoint,
-                json={
-                    app_settings.promptflow.request_field_name: pf_formatted_obj[-1]["inputs"][app_settings.promptflow.request_field_name],
-                    "chat_history": pf_formatted_obj[:-1],
-                },
+                json=request_payload,
                 headers=headers,
             )
+            
+        # Check if response is successful
+        if response.status_code != 200:
+            logging.error(f"PromptFlow API returned non-200 status code: {response.status_code}")
+            logging.error(f"Response content: {response.text}")
+            return {"error": f"PromptFlow API returned status code {response.status_code}"}
+            
         resp = response.json()
-        resp["id"] = request["messages"][-1]["id"]
+        logging.debug(f"Raw API response: {json.dumps(resp, indent=2)}")
+        
+        # Ensure response has an ID
+        if "id" not in resp and request["messages"][-1].get("id"):
+            resp["id"] = request["messages"][-1]["id"]
+            
+        # Detect potential field name issues and log warnings
+        if "output" in resp and isinstance(resp["output"], dict):
+            output_keys = list(resp["output"].keys())
+            logging.debug(f"Response output contains these keys: {output_keys}")
+            
+            # Check if we have default field names that don't match our configuration
+            if "output" in output_keys and app_settings.promptflow.response_field_name != "output":
+                logging.warning(f"Found 'output' key in response but configured response_field_name is '{app_settings.promptflow.response_field_name}'")
+                
+            if "citations" in output_keys and app_settings.promptflow.citations_field_name != "citations":
+                logging.warning(f"Found 'citations' key in response but configured citations_field_name is '{app_settings.promptflow.citations_field_name}'")
+                
+        # Debug log to examine the structure
+        logging.debug(f"Original promptflow response: {resp}")
         return resp
     except Exception as e:
         logging.error(f"An error occurred while making promptflow_request: {e}")
+        return {"error": str(e)}
 
 
 async def process_function_call(response):
@@ -439,14 +473,47 @@ async def send_chat_request(request_body, request_headers):
 
 async def complete_chat_request(request_body, request_headers):
     if app_settings.base_settings.use_promptflow:
+        # Log PromptFlow configuration
+        logging.debug(f"PromptFlow configuration: endpoint={app_settings.promptflow.endpoint}, " + 
+                     f"request_field_name={app_settings.promptflow.request_field_name}, " +
+                     f"response_field_name={app_settings.promptflow.response_field_name}, " +
+                     f"citations_field_name={app_settings.promptflow.citations_field_name}, " +
+                     f"timeout={app_settings.promptflow.response_timeout}")
+        
         response = await promptflow_request(request_body)
+        logging.debug(f"Raw PromptFlow response structure: {json.dumps(response, indent=2)}")
+        
+        # Check if output field exists and log its structure
+        if "output" in response and isinstance(response["output"], dict):
+            logging.debug(f"Found nested output structure with keys: {list(response['output'].keys())}")
+            
+            # Check if we're looking for the right fields
+            if app_settings.promptflow.response_field_name not in response["output"] and "output" in response["output"]:
+                logging.warning(f"Response field name '{app_settings.promptflow.response_field_name}' not found in output, but 'output' is present")
+                
+            if app_settings.promptflow.citations_field_name not in response["output"] and "citations" in response["output"]:
+                logging.warning(f"Citations field name '{app_settings.promptflow.citations_field_name}' not found in output, but 'citations' is present")
+        
         history_metadata = request_body.get("history_metadata", {})
-        return format_pf_non_streaming_response(
+        formatted_response = format_pf_non_streaming_response(
             response,
             history_metadata,
             app_settings.promptflow.response_field_name,
             app_settings.promptflow.citations_field_name
         )
+        logging.debug(f"Formatted response: {json.dumps(formatted_response, indent=2)}")
+        
+        # Check if the formatted response has actual content
+        if formatted_response.get("choices") and formatted_response["choices"][0].get("messages"):
+            messages = formatted_response["choices"][0]["messages"]
+            logging.debug(f"Response contains {len(messages)} messages")
+            for i, msg in enumerate(messages):
+                content_preview = msg.get("content", "")[:100] + "..." if msg.get("content") else "None"
+                logging.debug(f"Message {i}: role={msg.get('role')}, content_preview={content_preview}")
+        else:
+            logging.warning("Formatted response doesn't contain expected messages structure")
+            
+        return formatted_response
     else:
         response, apim_request_id = await send_chat_request(request_body, request_headers)
         history_metadata = request_body.get("history_metadata", {})
